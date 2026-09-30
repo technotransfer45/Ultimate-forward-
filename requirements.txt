@@ -1,2 +1,0 @@
-pyrofork>=2.3.40
-tgcrypto>=1.2.5
