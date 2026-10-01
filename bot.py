@@ -1,15 +1,5 @@
-"""Dual-userbot Telegram batch forwarder, auto-ingestion and filter bot (Pyrofork).
+"""Dual-userbot Telegram batch forwarder, auto-ingestion and filter bot (Pyrofork)."""
 
-Userbots (SESSION_STRING_1 / SESSION_STRING_2): listen to source channels and read their
-                          history. Every channel joined on EITHER account feeds one pipeline.
-Bot (BOT_TOKEN):          delivers to the two targets (no forward tag), deletes duplicates
-                          and answers admin commands.
-
-All deliveries go through ONE bounded FIFO queue with a mandatory pause between items.
-"""
-
-# The event loop MUST exist before pyrogram is imported / clients are created,
-# otherwise the clients bind to a different loop than the one we run.
 import asyncio
 
 LOOP = asyncio.new_event_loop()
@@ -60,6 +50,23 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 ChatRef = Union[int, str]
 
 # --------------------------------------------------------------------------- #
+# Web Server for Render Keep-Alive
+# --------------------------------------------------------------------------- #
+async def dummy_web_server() -> None:
+    async def handle_ping(request):
+        return web.Response(text="Bot is running!")
+
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+    port = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Render keep-alive server listening on port %d", port)
+
+# --------------------------------------------------------------------------- #
 # Clients: 1-2 userbots + delivery bot
 # --------------------------------------------------------------------------- #
 USERBOTS: List[Client] = [
@@ -85,7 +92,6 @@ bot = Client(
 
 
 def _no_preview_kwargs() -> Dict[str, Any]:
-    """disable_web_page_preview=True, or its newer equivalent if this build dropped it."""
     try:
         params = inspect.signature(Client.send_message).parameters
     except (TypeError, ValueError):
@@ -107,14 +113,11 @@ HTML = enums.ParseMode.HTML
 # Small data structures
 # --------------------------------------------------------------------------- #
 class RecentSet:
-    """Bounded insertion-ordered set (oldest entries are evicted first)."""
-
     def __init__(self, maxsize: int) -> None:
         self.maxsize = maxsize
         self._items: "OrderedDict[Hashable, None]" = OrderedDict()
 
     def add(self, key: Hashable) -> bool:
-        """Add key; return True if it was new, False if it was already present."""
         if key in self._items:
             self._items.move_to_end(key)
             return False
@@ -134,8 +137,6 @@ class RecentSet:
 
 
 class MediaSeen(RecentSet):
-    """file_unique_ids already sent to Target 2, persisted to disk."""
-
     def __init__(self, path: str, maxsize: int) -> None:
         super().__init__(maxsize)
         self.path = path
@@ -185,9 +186,6 @@ class MediaSeen(RecentSet):
             log.error("Could not save media cache: %s", exc)
 
 
-# --------------------------------------------------------------------------- #
-# Persistent state
-# --------------------------------------------------------------------------- #
 def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -203,19 +201,16 @@ def _as_float(value: Any, default: float) -> float:
 
 
 class State:
-    """Runtime settings + per-source checkpoints, persisted atomically to a JSON file."""
-
     def __init__(self, path: str) -> None:
         self.path = path
         self.sources: List[int] = []
         self.source_set: Set[int] = set()
-        self.env_known: List[int] = []  # env-provided sources that were already imported
+        self.env_known: List[int] = []
         self.target_links: int = config.TARGET_LINKS_CHAT
         self.target_media: int = config.TARGET_MEDIA_CHAT
         self.min_duration: int = config.MIN_VIDEO_DURATION
         self.min_size_mb: float = config.MIN_FILE_SIZE_MB
         self.paused: bool = False
-        # str(source id) -> {"last_read_id": int, "top_id": int, "done": bool}
         self.checkpoints: Dict[str, Dict[str, Any]] = {}
 
     @property
@@ -286,12 +281,10 @@ class State:
 
 STATE = State(config.STATE_FILE)
 MEDIA_SEEN = MediaSeen(config.MEDIA_SEEN_FILE, config.MEDIA_SEEN_MAX)
-SEEN = RecentSet(config.SEEN_MESSAGES_MAX)  # (chat_id, message_id) seen by any userbot
+SEEN = RecentSet(config.SEEN_MESSAGES_MAX)
 
 
 class Runtime:
-    """Non-persistent runtime flags and counters."""
-
     def __init__(self) -> None:
         self.stop_event = asyncio.Event()
         self.ingest_task: Optional["asyncio.Task[None]"] = None
@@ -300,8 +293,8 @@ class Runtime:
         self.current_source: Optional[int] = None
         self.ingesting: Set[int] = set()
         self.live_max: Dict[int, int] = {}
-        self.owner: Dict[Any, int] = {}  # chat id -> index of the userbot that can read it
-        self.no_bot_copy: Set[int] = set()  # sources the bot itself can't copy from
+        self.owner: Dict[Any, int] = {}
+        self.no_bot_copy: Set[int] = set()
         self.stats: Dict[str, int] = {
             "media_sent": 0,
             "links_sent": 0,
@@ -328,11 +321,7 @@ DIALOGS_REFRESHED: Dict[str, float] = {}
 ACCESS_ERRORS = (PeerIdInvalid, ChannelPrivate, ChannelInvalid, KeyError, ValueError)
 
 
-# --------------------------------------------------------------------------- #
-# FloodWait-safe helper, error text, replies
-# --------------------------------------------------------------------------- #
 async def flood_retry(factory: Callable[[], Awaitable[Any]], label: str = "call") -> Any:
-    """Await factory(); on FloodWait sleep e.value + 1 seconds and retry, forever."""
     while True:
         try:
             return await factory()
@@ -344,15 +333,9 @@ async def flood_retry(factory: Callable[[], Awaitable[Any]], label: str = "call"
 
 def friendly_error(exc: BaseException) -> str:
     if isinstance(exc, (ChatAdminRequired, MessageDeleteForbidden)):
-        return (
-            "Missing permission. Make the bot (or the userbot account) an admin with the "
-            "<b>Delete messages</b> / <b>Post messages</b> rights."
-        )
+        return "Missing permission. Make the bot/userbot admin with Post/Delete rights."
     if isinstance(exc, (PeerIdInvalid, ChannelPrivate, ChannelInvalid, KeyError)):
-        return (
-            "Can't access that chat. A userbot must be a member to read it; the bot must be "
-            "admin in the targets. For a fresh bot session, post something in the channel and retry."
-        )
+        return "Can't access chat. Userbot must be a member; bot must be admin in targets."
     if isinstance(exc, (UsernameNotOccupied, UsernameInvalid)):
         return "That username doesn't exist or is invalid."
     if isinstance(exc, RPCError):
@@ -365,7 +348,7 @@ async def reply_html(message: Message, text: str) -> Optional[Message]:
         return await flood_retry(
             lambda: message.reply_text(text[:4096], parse_mode=HTML, **NO_PREVIEW), "reply"
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.exception("reply failed")
         return None
 
@@ -379,18 +362,11 @@ async def edit_html(target: Optional[Message], text: str) -> None:
         )
     except MessageNotModified:
         pass
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.exception("edit failed")
 
 
-# --------------------------------------------------------------------------- #
-# Userbot access (no per-channel get_chat calls)
-# --------------------------------------------------------------------------- #
 async def refresh_dialogs(client: Client, force: bool = False) -> bool:
-    """Populate a userbot's peer cache with ONE paginated get_dialogs() pass.
-
-    Rate-limited per client. Returns True if a refresh was actually performed.
-    """
     now = time.monotonic()
     last = DIALOGS_REFRESHED.get(client.name)
     if not force and last is not None and now - last < config.DIALOG_REFRESH_INTERVAL:
@@ -399,13 +375,12 @@ async def refresh_dialogs(client: Client, force: bool = False) -> bool:
     try:
         async for _ in client.get_dialogs():
             pass
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("get_dialogs failed for %s: %s", client.name, exc)
     return True
 
 
 async def userbot_call(chat_id: Any, fn: Callable[[Client], Awaitable[Any]], label: str) -> Any:
-    """Run fn(client) on the userbot that can read chat_id (tries every account)."""
     preferred = RT.owner.get(chat_id)
     order = list(range(len(USERBOTS)))
     if preferred is not None and preferred in order:
@@ -423,15 +398,12 @@ async def userbot_call(chat_id: Any, fn: Callable[[Client], Awaitable[Any]], lab
             except ACCESS_ERRORS as exc:
                 last_exc = exc
                 if attempt == 1 and await refresh_dialogs(client):
-                    continue  # peer cache was stale: retry once on the same account
+                    continue
                 break
     assert last_exc is not None
     raise last_exc
 
 
-# --------------------------------------------------------------------------- #
-# Pre-filters and sanitization
-# --------------------------------------------------------------------------- #
 def _adult_alternative(keyword: str) -> str:
     escaped = re.escape(keyword)
     if keyword[-1].isalnum():
@@ -456,7 +428,6 @@ PROMO_TAIL_RE = re.compile(
 
 
 def message_haystack(message: Message) -> str:
-    """Text + caption + file names, for the adult-content shield."""
     parts = [str(message.text or ""), str(message.caption or "")]
     for attr in ("video", "document", "audio", "animation"):
         name = getattr(getattr(message, attr, None), "file_name", None)
@@ -470,7 +441,6 @@ def is_adult(message: Message) -> bool:
 
 
 def sanitize_text(raw: str) -> str:
-    """Strip @mentions, 'Join:/Credit: @x' promos and spam lines; normalize whitespace."""
     out: List[str] = []
     for line in (raw or "").splitlines():
         if SPAM_RE.search(line):
@@ -480,22 +450,18 @@ def sanitize_text(raw: str) -> str:
         if new != line:
             new = re.sub(r"[ \t]{2,}", " ", new).strip()
             if not re.search(r"\w", new):
-                continue  # nothing but leftover symbols
+                continue
         out.append(new.rstrip())
     text = "\n".join(out)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-# --------------------------------------------------------------------------- #
-# Deep link scanner
-# --------------------------------------------------------------------------- #
 URL_RE = re.compile(r"https?://[^\s<>\"'\[\]\(\)]+", re.IGNORECASE)
 TRAILING_JUNK = ".,;:!?)]}>*_`~'\""
 
 
 def clean_url(raw: str) -> str:
-    """Strip whitespace, markdown brackets and trailing punctuation."""
     url = (raw or "").strip().strip("<>[]()")
     return url.rstrip(TRAILING_JUNK).strip()
 
@@ -529,7 +495,6 @@ def is_valid_external_url(url: str) -> bool:
 
 
 def url_priority(url: str) -> int:
-    """0 for known streaming hosts / TeraBox family, 1 for everything else."""
     host = _host_of(url)
     for domain in config.PRIORITY_DOMAINS:
         if host == domain or host.endswith("." + domain):
@@ -541,17 +506,15 @@ def url_priority(url: str) -> int:
 
 
 def rank_urls(urls: List[str]) -> List[str]:
-    return sorted(urls, key=url_priority)  # stable inside each tier
+    return sorted(urls, key=url_priority)
 
 
 def _entity_text(text: str, offset: int, length: int) -> str:
-    """Telegram entity offsets are UTF-16 code units, so slice accordingly."""
     raw = text.encode("utf-16-le")
     return raw[offset * 2 : (offset + length) * 2].decode("utf-16-le", errors="ignore")
 
 
 def _iter_button_items(node: Any) -> Iterator[Tuple[str, str]]:
-    """Recursively walk a keyboard (markup -> rows -> buttons) yielding (url, button text)."""
     if node is None:
         return
     if isinstance(node, (list, tuple)):
@@ -574,15 +537,11 @@ def _iter_button_items(node: Any) -> Iterator[Tuple[str, str]]:
 
 
 def extract_valid_urls(message: Message) -> List[str]:
-    """Deep-scan text/caption, entities and inline keyboard for external URLs."""
     candidates: List[str] = []
-
-    # Layer 1: raw text and caption regex.
     for blob in (message.text, message.caption):
         if blob:
             candidates.extend(URL_RE.findall(str(blob)))
 
-    # Layer 2: entities and caption entities (hyperlinks + plain URL entities).
     for blob, entities in (
         (message.text, message.entities),
         (message.caption, message.caption_entities),
@@ -596,7 +555,6 @@ def extract_valid_urls(message: Message) -> List[str]:
             elif entity.type == enums.MessageEntityType.URL and text:
                 candidates.append(_entity_text(text, entity.offset, entity.length))
 
-    # Layer 3: inline keyboard, scanned recursively.
     candidates.extend(url for url, _ in _iter_button_items(message.reply_markup))
 
     seen: Set[str] = set()
@@ -614,7 +572,6 @@ def extract_valid_urls(message: Message) -> List[str]:
 
 
 def button_labels(message: Message) -> Dict[str, str]:
-    """Sanitized inline-button texts keyed by URL (used as nicer button labels)."""
     labels: Dict[str, str] = {}
     for url, text in _iter_button_items(message.reply_markup):
         key = clean_url(url).rstrip("/")
@@ -624,12 +581,9 @@ def button_labels(message: Message) -> Dict[str, str]:
     return labels
 
 
-# --------------------------------------------------------------------------- #
-# Jobs and routing decision
-# --------------------------------------------------------------------------- #
 @dataclass
 class Job:
-    kind: str  # "media" | "links"
+    kind: str
     source_id: int
     message_id: int = 0
     caption: str = ""
@@ -665,7 +619,6 @@ def build_links_text(raw_text: str, urls: List[str]) -> str:
 
 
 def build_job(message: Message, allow_dup: bool = False) -> Optional[Job]:
-    """Apply every pre-filter and routing rule. None means: drop the message."""
     if message.empty or message.service or not message.chat:
         return None
     chat_id = message.chat.id
@@ -677,7 +630,6 @@ def build_job(message: Message, allow_dup: bool = False) -> Optional[Job]:
         RT.stats["dropped_adult"] += 1
         return None
 
-    # Target 2: media files.
     if media_qualifies(message):
         key = media_unique_id(message)
         if key and not allow_dup and key in MEDIA_SEEN:
@@ -692,10 +644,9 @@ def build_job(message: Message, allow_dup: bool = False) -> Optional[Job]:
             media_key=key,
         )
 
-    # Target 1: web / shortener links.
     urls = rank_urls(extract_valid_urls(message))
     if not urls:
-        RT.stats["dropped_no_content"] += 1  # promo-only text, short clips, small files...
+        RT.stats["dropped_no_content"] += 1
         return None
 
     labels_by_url = button_labels(message)
@@ -711,13 +662,11 @@ def build_job(message: Message, allow_dup: bool = False) -> Optional[Job]:
 
 
 def reserve_job(job: Job) -> None:
-    """Register the media fingerprint as soon as a job is committed to the queue."""
     if job.kind == "media" and job.media_key:
         job.reserved = MEDIA_SEEN.add(job.media_key)
 
 
 def release_job(job: Job) -> None:
-    """Undo the fingerprint reservation of a job that was not delivered."""
     if job.reserved and job.media_key:
         MEDIA_SEEN.discard(job.media_key)
         job.reserved = False
@@ -734,7 +683,6 @@ def submit_live(job: Job) -> None:
 
 
 async def submit_ingest(job: Job) -> str:
-    """Queue a history item and wait until it was delivered / failed / cancelled."""
     reserve_job(job)
     job.future = asyncio.get_running_loop().create_future()
     try:
@@ -746,7 +694,6 @@ async def submit_ingest(job: Job) -> str:
 
 
 def drain_queue() -> int:
-    """Discard every pending job, releasing anyone awaiting it."""
     drained = 0
     while True:
         try:
@@ -761,9 +708,6 @@ def drain_queue() -> int:
     return drained
 
 
-# --------------------------------------------------------------------------- #
-# Delivery (runs only inside the single worker)
-# --------------------------------------------------------------------------- #
 async def deliver_media(job: Job) -> None:
     target = STATE.target_media
     if not target:
@@ -781,13 +725,11 @@ async def deliver_media(job: Job) -> None:
         try:
             await flood_retry(lambda: bot.copy_message(**kwargs), "bot.copy_message")
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if isinstance(exc, ACCESS_ERRORS):
-                # The bot can't see this source channel: don't retry it for every item.
                 RT.no_bot_copy.add(job.source_id)
-            log.info("bot.copy_message failed (%s); falling back to a userbot copy", exc)
+            log.info("bot.copy_message failed (%s); falling back to userbot", exc)
 
-    # Same server-side copy (still no "Forwarded from" header), done by a userbot.
     await userbot_call(
         job.source_id, lambda client: client.copy_message(**kwargs), "userbot.copy_message"
     )
@@ -816,12 +758,11 @@ async def deliver_links(job: Job) -> None:
     try:
         await flood_retry(lambda: _send(True), "bot.send_message")
     except BadRequest as exc:
-        log.warning("send_message with buttons failed (%s); retrying without buttons", exc)
+        log.warning("send_message with buttons failed (%s); retrying plain", exc)
         await flood_retry(lambda: _send(False), "bot.send_message")
 
 
 async def delivery_worker() -> None:
-    """Persistent FIFO worker: one delivery at a time, 1.5 s apart."""
     log.info("Delivery worker started")
     while True:
         job = await QUEUE.get()
@@ -840,7 +781,7 @@ async def delivery_worker() -> None:
                 job.future.set_result("cancelled")
             QUEUE.task_done()
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             RT.stats["failed"] += 1
             log.exception("Delivery failed (%s %s/%s)", job.kind, job.source_id, job.message_id)
 
@@ -853,9 +794,6 @@ async def delivery_worker() -> None:
         await asyncio.sleep(config.DELIVERY_DELAY)
 
 
-# --------------------------------------------------------------------------- #
-# Live listener (attached to BOTH userbots)
-# --------------------------------------------------------------------------- #
 def stopped() -> bool:
     return RT.stop_event.is_set() or STATE.paused
 
@@ -869,7 +807,6 @@ source_filter = filters.create(_source_filter)
 
 
 def note_live_message(chat_id: int, message_id: int) -> None:
-    """Keep last_read_id accurate for sources that are already fully ingested."""
     if chat_id in RT.ingesting:
         RT.live_max[chat_id] = max(RT.live_max.get(chat_id, 0), message_id)
         return
@@ -889,7 +826,6 @@ async def on_source_message(client: Client, message: Message) -> None:
             return
         if STATE.paused:
             return
-        # Both userbots may be members of the same channel: process each post only once.
         if not SEEN.add((chat_id, message.id)):
             RT.stats["dropped_seen"] += 1
             return
@@ -900,7 +836,7 @@ async def on_source_message(client: Client, message: Message) -> None:
         if job is not None:
             submit_live(job)
         note_live_message(chat_id, message.id)
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.exception("Error while processing live message")
 
 
@@ -908,12 +844,9 @@ for _client in USERBOTS:
     _client.add_handler(MessageHandler(on_source_message, source_filter & ~filters.service))
 
 
-# --------------------------------------------------------------------------- #
-# Automatic / manual history ingestion
-# --------------------------------------------------------------------------- #
 @dataclass
 class IngestResult:
-    status: str = "done"  # done | interrupted | aborted
+    status: str = "done"
     sent: int = 0
     failed: int = 0
     dropped: int = 0
@@ -938,7 +871,6 @@ async def _fetch_top(client: Client, chat_id: int) -> int:
 
 
 async def ingest_source(sid: int, allow_dup: bool) -> IngestResult:
-    """Fetch one source oldest -> newest, route each message, update last_read_id."""
     result = IngestResult()
     key = str(sid)
     top = await userbot_call(sid, lambda c: _fetch_top(c, sid), "get_chat_history(top)")
@@ -980,7 +912,7 @@ async def ingest_source(sid: int, allow_dup: bool) -> IngestResult:
                     if is_new or allow_dup:
                         job = build_job(message, allow_dup=allow_dup)
                     else:
-                        RT.stats["dropped_seen"] += 1  # already handled live
+                        RT.stats["dropped_seen"] += 1
 
                 if job is None:
                     result.dropped += 1
@@ -988,7 +920,7 @@ async def ingest_source(sid: int, allow_dup: bool) -> IngestResult:
                     outcome = await submit_ingest(job)
                     if outcome == "cancelled":
                         result.status = "interrupted"
-                        return result  # not delivered: checkpoint stays before this item
+                        return result
                     if outcome == "ok":
                         result.sent += 1
                         consecutive_failures = 0
@@ -997,10 +929,7 @@ async def ingest_source(sid: int, allow_dup: bool) -> IngestResult:
                         consecutive_failures += 1
                         if consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
                             result.status = "aborted"
-                            result.note = (
-                                f"{consecutive_failures} deliveries failed in a row "
-                                "(check the bot's admin rights in the targets)"
-                            )
+                            result.note = f"{consecutive_failures} failures in a row"
                             return result
 
                 entry["last_read_id"] = mid
@@ -1029,12 +958,10 @@ def select_sources(mode: str) -> List[int]:
         return ids
     if mode == "skip":
         return [s for s in ids if str(s) not in STATE.checkpoints]
-    # "auto": NEW_SOURCE (no last_read_id) or an interrupted ingestion
     return [s for s in ids if not STATE.checkpoints.get(str(s), {}).get("done")]
 
 
 async def sleep_or_stop(seconds: float) -> bool:
-    """Sleep, waking early if /stop arrives. Returns True if we were stopped."""
     try:
         await asyncio.wait_for(RT.stop_event.wait(), timeout=seconds)
         return True
@@ -1052,8 +979,6 @@ async def notify_run(summary: RunSummary, notify_chat: Optional[int]) -> None:
     if summary.halted:
         body.append(f"⚠️ {summary.halted}")
     body.extend(summary.lines[:40])
-    if len(summary.lines) > 40:
-        body.append(f"…and {len(summary.lines) - 40} more")
     text = "\n".join(body)[:4096]
 
     for chat in [notify_chat] if notify_chat else list(config.ADMINS):
@@ -1061,16 +986,11 @@ async def notify_run(summary: RunSummary, notify_chat: Optional[int]) -> None:
             await flood_retry(
                 lambda: bot.send_message(chat, text, parse_mode=HTML, **NO_PREVIEW), "notify"
             )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not send ingestion summary to %s: %s", chat, exc)
+        except Exception as exc:
+            log.warning("Could not send summary to %s: %s", chat, exc)
 
 
 async def auto_clone_new_sources(mode: str = "auto", notify_chat: Optional[int] = None) -> None:
-    """Background ingestion. 'auto' handles NEW_SOURCE channels without any admin command.
-
-    mode: auto | continue | duplicate | skip. Channels are processed one after another with
-    a 5 s pause in between; sources added while the task runs are picked up automatically.
-    """
     RT.ingest_mode = mode
     summary = RunSummary()
     processed: Set[int] = set()
@@ -1097,7 +1017,7 @@ async def auto_clone_new_sources(mode: str = "auto", notify_chat: Optional[int] 
                 result = await ingest_source(sid, allow_dup=(mode == "duplicate"))
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.warning("Ingestion of %s failed: %s", sid, exc)
                 summary.lines.append(f"❌ <code>{sid}</code>: {friendly_error(exc)}")
                 summary.failed += 1
@@ -1107,13 +1027,9 @@ async def auto_clone_new_sources(mode: str = "auto", notify_chat: Optional[int] 
             summary.failed += result.failed
             summary.dropped += result.dropped
             if result.status == "done":
-                summary.lines.append(
-                    f"✅ <code>{sid}</code>: {result.sent} delivered, {result.dropped} dropped"
-                )
+                summary.lines.append(f"✅ <code>{sid}</code>: {result.sent} delivered")
             else:
-                summary.lines.append(
-                    f"⏸ <code>{sid}</code>: {result.status} — {result.sent} delivered"
-                )
+                summary.lines.append(f"⏸ <code>{sid}</code>: {result.status}")
                 if result.status == "aborted":
                     summary.halted = f"<code>{sid}</code>: {result.note}"
                     break
@@ -1130,11 +1046,9 @@ async def auto_clone_new_sources(mode: str = "auto", notify_chat: Optional[int] 
 
 
 def schedule_auto_ingestion(mode: str = "auto", notify_chat: Optional[int] = None) -> bool:
-    """Start the background ingestion task unless one is running / we're paused."""
     if STATE.paused or RT.stop_event.is_set() or RT.ingest_active:
         return False
     if not (STATE.target_links and STATE.target_media):
-        log.info("Ingestion not started: both targets must be set (/session)")
         return False
     if not select_sources(mode):
         return False
@@ -1143,7 +1057,6 @@ def schedule_auto_ingestion(mode: str = "auto", notify_chat: Optional[int] = Non
 
 
 async def stop_all(timeout: float = 45.0) -> str:
-    """Halt ingestion + live forwarding. Checkpoints are saved, queued items discarded."""
     was_ingesting = RT.ingest_active
     STATE.paused = True
     STATE.save()
@@ -1159,14 +1072,11 @@ async def stop_all(timeout: float = 45.0) -> str:
     STATE.save()
     parts = ["⏹ Live forwarding paused"]
     if was_ingesting:
-        parts.append("ingestion halted (checkpoints saved)")
+        parts.append("ingestion halted")
     parts.append(f"{drained} queued item(s) discarded")
     return ", ".join(parts) + ".\nUse /resume to continue."
 
 
-# --------------------------------------------------------------------------- #
-# History access shared by /cleandup and /status
-# --------------------------------------------------------------------------- #
 async def _collect_history(client: Client, chat: ChatRef, limit: int) -> List[Message]:
     out: List[Message] = []
     async for msg in client.get_chat_history(chat, limit=limit):
@@ -1175,15 +1085,10 @@ async def _collect_history(client: Client, chat: ChatRef, limit: int) -> List[Me
 
 
 async def fetch_history(chat: ChatRef, limit: int) -> List[Message]:
-    """Fetch recent history (newest first).
-
-    Bot accounts normally can't read history (BOT_METHOD_INVALID), so the bot is tried
-    first and the userbots are the automatic fallback.
-    """
     try:
         return await flood_retry(lambda: _collect_history(bot, chat, limit), "bot.get_chat_history")
-    except Exception as exc:  # noqa: BLE001
-        log.info("bot.get_chat_history failed (%s); using a userbot", exc)
+    except Exception as exc:
+        log.info("bot.get_chat_history failed (%s); using userbot", exc)
     return await userbot_call(chat, lambda c: _collect_history(c, chat, limit), "get_chat_history")
 
 
@@ -1204,16 +1109,14 @@ def message_fingerprint(message: Message) -> Optional[str]:
 
 
 async def delete_batch(chat: ChatRef, ids: List[int]) -> int:
-    """Delete via the bot (FloodWait-safe); fall back to a userbot on other errors."""
     try:
         result = await flood_retry(lambda: bot.delete_messages(chat, ids), "bot.delete_messages")
-    except Exception as bot_exc:  # noqa: BLE001
-        log.info("bot.delete_messages failed (%s); trying a userbot", bot_exc)
+    except Exception as bot_exc:
         try:
             result = await userbot_call(
                 chat, lambda c: c.delete_messages(chat, ids), "userbot.delete_messages"
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             raise bot_exc
     if isinstance(result, bool):
         return len(ids) if result else 0
@@ -1224,10 +1127,9 @@ async def delete_batch(chat: ChatRef, ids: List[int]) -> int:
 
 async def dedupe_chat(chat: ChatRef) -> Tuple[int, int]:
     history = await fetch_history(chat, config.CLEANDUP_SCAN_LIMIT)
-
     seen: Set[str] = set()
     duplicate_ids: List[int] = []
-    for msg in reversed(history):  # oldest first: keep the original
+    for msg in reversed(history):
         fingerprint = message_fingerprint(msg)
         if fingerprint is None:
             continue
@@ -1246,23 +1148,19 @@ async def dedupe_chat(chat: ChatRef) -> Tuple[int, int]:
 
 
 def parse_chat_arg(message: Message) -> Optional[ChatRef]:
-    """Return the chat given as the first command argument (id, @name or link)."""
     if len(message.command) < 2:
         return None
     parsed = config.parse_chat_list(message.command[1])
     return parsed[0] if parsed else None
 
 
-# --------------------------------------------------------------------------- #
-# Session validation (targets only: never one RPC per source)
-# --------------------------------------------------------------------------- #
 async def check_target(chat_id: int, label: str) -> Tuple[bool, str]:
     try:
         chat = await flood_retry(lambda: bot.get_chat(chat_id), "bot.get_chat")
         member = await flood_retry(
             lambda: bot.get_chat_member(chat_id, "me"), "bot.get_chat_member"
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return False, f"❌ {label} <code>{chat_id}</code>: {friendly_error(exc)}"
 
     title = html.escape(chat.title or str(chat_id))
@@ -1279,11 +1177,11 @@ async def check_target(chat_id: int, label: str) -> Tuple[bool, str]:
         and priv is not None
         and not getattr(priv, "can_post_messages", False)
     ):
-        return False, f"❌ {label} {title}: the bot lacks the <b>Post messages</b> right"
+        return False, f"❌ {label} {title}: the bot lacks Post messages right"
 
     warn = ""
     if priv is not None and not getattr(priv, "can_delete_messages", True):
-        warn = " ⚠️ no <b>Delete messages</b> right (/cleandup will fail)"
+        warn = " ⚠️ no Delete messages right"
     return True, f"✅ {label} {title}{warn}"
 
 
@@ -1302,7 +1200,7 @@ async def apply_session(data: Dict[str, Any]) -> Tuple[bool, str]:
         report.append(line)
         ok = ok and good
     if not ok:
-        return False, "<b>Nothing was saved</b> — fix these and run /session again:\n" + "\n".join(report)
+        return False, "<b>Nothing saved</b> — fix permissions:\n" + "\n".join(report)
 
     if new_links is not None:
         STATE.target_links = new_links
@@ -1320,29 +1218,18 @@ async def apply_session(data: Dict[str, Any]) -> Tuple[bool, str]:
             STATE.checkpoints.pop(key, None)
         added = len(STATE.source_set - before)
         removed = len(before - STATE.source_set)
-        report.append(
-            f"✅ Sources: <b>{len(STATE.sources)}</b> total (+{added} / -{removed})"
-        )
-        if data.get("ignored_count"):
-            report.append(f"ℹ️ {data['ignored_count']} entries skipped (ignored channels)")
+        report.append(f"✅ Sources: <b>{len(STATE.sources)}</b> (+{added} / -{removed})")
     else:
         report.append(f"ℹ️ Sources unchanged (<b>{len(STATE.sources)}</b>)")
 
     STATE.save()
-
     pending = len(select_sources("auto"))
     if pending:
         started = schedule_auto_ingestion()
-        report.append(
-            f"📥 {pending} new/unfinished source(s) will be ingested automatically"
-            + ("" if started or RT.ingest_active else " once forwarding is resumed")
-        )
+        report.append(f"📥 {pending} source(s) will be ingested automatically")
     return True, "<b>Session saved</b>\n" + "\n".join(report)
 
 
-# --------------------------------------------------------------------------- #
-# Admin commands
-# --------------------------------------------------------------------------- #
 admin_only = filters.user(config.ADMINS)
 
 
@@ -1355,10 +1242,7 @@ def live_status_text() -> str:
         current = ""
         if RT.current_source is not None:
             entry = STATE.checkpoints.get(str(RT.current_source), {})
-            current = (
-                f" — <code>{RT.current_source}</code> "
-                f"({entry.get('last_read_id', 0)}/{entry.get('top_id', 0)})"
-            )
+            current = f" — <code>{RT.current_source}</code> ({entry.get('last_read_id', 0)}/{entry.get('top_id', 0)})"
         ingestion = f"running ({RT.ingest_mode}){current}"
     else:
         ingestion = "idle"
@@ -1368,48 +1252,14 @@ def live_status_text() -> str:
         f"• Forwarding: <b>{state}</b>\n"
         f"• Ingestion: <b>{ingestion}</b>\n"
         f"• Userbots: <b>{len(USERBOTS)}</b> | Bot: <b>1</b>\n"
-        f"• Sources: <b>{total}</b> (ingested {done}, in progress {started - done}, "
-        f"new {total - started}) | ignored channels: {len(config.IGNORED_SOURCE_CHATS)}\n"
+        f"• Sources: <b>{total}</b> (done {done}, in progress {started - done}, new {total - started})\n"
         f"• Queue: <b>{QUEUE.qsize()}</b>/{config.QUEUE_MAXSIZE}\n"
         f"• Links target: <code>{STATE.target_links or '—'}</code>\n"
         f"• Media target: <code>{STATE.target_media or '—'}</code>\n"
         f"• Min video: <b>{STATE.min_duration}s</b> | Min file: <b>{STATE.min_size_mb:g} MB</b>\n\n"
         "<b>Statistics</b>\n"
         f"• Delivered: media <b>{s['media_sent']}</b>, links <b>{s['links_sent']}</b>, failed <b>{s['failed']}</b>\n"
-        f"• Dropped: adult {s['dropped_adult']}, ignored {s['dropped_ignored']}, "
-        f"duplicate media {s['dropped_dup_media']}, no link/media {s['dropped_no_content']}, "
-        f"already seen {s['dropped_seen']}, queue full {s['dropped_queue_full']}\n"
-        f"• Media fingerprints tracked: {len(MEDIA_SEEN)}"
-    )
-
-
-async def chat_report(chat: ChatRef) -> str:
-    history = await fetch_history(chat, config.STATUS_SCAN_LIMIT)
-    videos = documents = photos = audios = 0
-    links: Dict[str, str] = {}
-    for msg in history:
-        if msg.empty or msg.service:
-            continue
-        videos += 1 if msg.video else 0
-        documents += 1 if msg.document else 0
-        photos += 1 if msg.photo else 0
-        audios += 1 if (msg.audio or msg.voice) else 0
-        for url in extract_valid_urls(msg):
-            links.setdefault(url.rstrip("/"), url)
-
-    sample = []
-    for url in list(links.values())[:10]:
-        shown = url if len(url) <= 80 else url[:77] + "…"
-        sample.append(f"• {html.escape(shown)}")
-    return (
-        f"📊 <b>Chat report</b> (<code>{html.escape(str(chat))}</code>)\n\n"
-        f"• Messages scanned: <b>{len(history)}</b>\n"
-        f"• 📁 Files/Documents: <b>{documents}</b>\n"
-        f"• 🎬 Videos: <b>{videos}</b>\n"
-        f"• 🖼 Photos: <b>{photos}</b>\n"
-        f"• 🎧 Audio/Voice: <b>{audios}</b>\n"
-        f"• 🔗 Unique external links: <b>{len(links)}</b>\n\n"
-        f"<b>Link previews:</b>\n{chr(10).join(sample) if sample else '—'}"
+        f"• Dropped: adult {s['dropped_adult']}, duplicate media {s['dropped_dup_media']}, no link/media {s['dropped_no_content']}"
     )
 
 
@@ -1418,32 +1268,26 @@ async def help_handler(client: Client, message: Message) -> None:
     await reply_html(
         message,
         "<b>Admin commands</b>\n"
-        "/session — set sources (IDs) + target channels\n"
-        "/clone — manual re-clone / force continue\n"
-        "/status [chat] — live status, or scan a chat\n"
-        "/stop — pause cloning and live forwarding\n"
-        "/resume — resume forwarding and background ingestion\n"
-        "/remove — reset saved sources and checkpoints\n"
-        "/cleandup [chat] — delete duplicates (default: both targets)\n"
-        "/set_duration &lt;seconds&gt; — min video duration\n"
+        "/session — set sources + targets\n"
+        "/clone — start history clone\n"
+        "/status — check live progress\n"
+        "/stop — pause forwarding and ingestion\n"
+        "/resume — resume background operations\n"
+        "/set_duration &lt;sec&gt; — min video duration\n"
         "/set_size &lt;mb&gt; — min file size",
     )
 
 
-# ---- /session (interactive) ------------------------------------------------ #
 @bot.on_message(filters.command("session") & admin_only)
 async def session_handler(client: Client, message: Message) -> None:
     PENDING_SESSION[message.from_user.id] = {"step": "sources", "data": {"source_ids": []}}
     await reply_html(
         message,
-        "🛠 <b>Session setup (1/3)</b>\n"
-        "Send source channel IDs (<code>-100…</code>), separated by spaces/commas/new lines. "
-        "You can send several messages. Usernames are not accepted (no per-channel lookups).\n\n"
-        "• <code>done</code> — finish this step\n"
-        "• <code>keep</code> — leave the sources unchanged\n"
-        "• start your first message with <code>add</code> to append instead of replace\n"
-        "• <code>cancel</code> — abort\n\n"
-        f"Current sources: <b>{len(STATE.sources)}</b>",
+        "🛠 <b>Session setup (1/3)</b>\nSend source channel IDs (<code>-100…</code>).\n"
+        "• <code>done</code> — finish\n"
+        "• <code>keep</code> — keep current\n"
+        "• start with <code>add</code> to append\n\n"
+        f"Current: <b>{len(STATE.sources)}</b>",
     )
 
 
@@ -1471,27 +1315,17 @@ async def session_dialog(client: Client, message: Message) -> None:
             else:
                 data.setdefault("mode", "replace")
             pending["step"] = "links"
-            await reply_html(
-                message,
-                "🛠 <b>Session setup (2/3)</b>\nSend <b>TARGET_LINKS_CHAT</b> (numeric ID like "
-                f"<code>-100…</code>) or <code>keep</code>.\nCurrent: <code>{STATE.target_links or '—'}</code>",
-            )
+            await reply_html(message, "🛠 <b>Session setup (2/3)</b>\nSend TARGET_LINKS_CHAT or <code>keep</code>.")
             return
 
         if lowered.startswith("add") and "mode" not in data:
             data["mode"] = "add"
             text = text[3:]
-        ids, rejected = config.parse_chat_ids(text)
-        skipped = [i for i in ids if i in config.IGNORED_SOURCE_CHATS]
-        data["ignored_count"] = data.get("ignored_count", 0) + len(skipped)
-        for chat_id in ids:
-            if chat_id not in config.IGNORED_SOURCE_CHATS and chat_id not in data["source_ids"]:
-                data["source_ids"].append(chat_id)
-        note = f" ⚠️ {len(rejected)} non-numeric entr{'y' if len(rejected) == 1 else 'ies'} ignored." if rejected else ""
-        await reply_html(
-            message,
-            f"➕ Collected <b>{len(data['source_ids'])}</b> ID(s).{note} Send more, or <code>done</code>.",
-        )
+        ids, _ = config.parse_chat_ids(text)
+        for cid in ids:
+            if cid not in config.IGNORED_SOURCE_CHATS and cid not in data["source_ids"]:
+                data["source_ids"].append(cid)
+        await reply_html(message, f"➕ Collected <b>{len(data['source_ids'])}</b> ID(s). Send more or <code>done</code>.")
         return
 
     if step in ("links", "media"):
@@ -1500,118 +1334,76 @@ async def session_dialog(client: Client, message: Message) -> None:
         elif text.lstrip("-").isdigit():
             data[step] = int(text)
         else:
-            await reply_html(message, "Please send a numeric chat ID (e.g. <code>-1001234567890</code>) or <code>keep</code>.")
+            await reply_html(message, "Send a numeric chat ID or <code>keep</code>.")
             return
 
         if step == "links":
             pending["step"] = "media"
-            await reply_html(
-                message,
-                "🛠 <b>Session setup (3/3)</b>\nSend <b>TARGET_MEDIA_CHAT</b> (numeric ID) or "
-                f"<code>keep</code>.\nCurrent: <code>{STATE.target_media or '—'}</code>",
-            )
+            await reply_html(message, "🛠 <b>Session setup (3/3)</b>\nSend TARGET_MEDIA_CHAT or <code>keep</code>.")
             return
 
         PENDING_SESSION.pop(uid, None)
-        status = await reply_html(message, "🔎 Checking the bot's rights in the targets…")
+        status = await reply_html(message, "🔎 Checking target permissions…")
         try:
             ok, report = await apply_session(data)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("apply_session failed")
-            ok, report = False, f"Validation crashed: {friendly_error(exc)}"
+        except Exception as exc:
+            ok, report = False, f"Crash: {friendly_error(exc)}"
         await edit_html(status, report)
 
 
-# ---- /clone ---------------------------------------------------------------- #
 async def start_manual_clone(message: Message, mode: str) -> None:
     RT.stop_event.clear()
     STATE.paused = False
     STATE.save()
     if RT.ingest_active:
-        await reply_html(message, "Ingestion is already running. Use /status or /stop.")
+        await reply_html(message, "Ingestion already running.")
         return
     if not schedule_auto_ingestion(mode, message.chat.id):
-        await reply_html(message, "Nothing to clone (check /status: sources and both targets).")
+        await reply_html(message, "Nothing to clone.")
         return
-    labels = {
-        "auto": "Ingesting new/unfinished sources…",
-        "continue": "Resuming from saved checkpoints (and catching up finished sources)…",
-        "duplicate": "Re-cloning every source from the start (duplicates allowed)…",
-        "skip": "Cloning only sources that were never started…",
-    }
-    await reply_html(message, f"▶️ {labels.get(mode, 'Starting…')}\nUse /status to follow progress.")
+    await reply_html(message, f"▶️ Started clone ({mode}). Use /status.")
 
 
 @bot.on_message(filters.command("clone") & admin_only)
 async def clone_handler(client: Client, message: Message) -> None:
     uid = message.from_user.id
     if RT.ingest_active:
-        await reply_html(message, "Ingestion is already running. Use /status or /stop.")
+        await reply_html(message, "Ingestion already running. Use /status or /stop.")
         return
-    if not STATE.sources:
-        await reply_html(message, "No sources configured. Run /session first.")
-        return
-    if not STATE.target_links or not STATE.target_media:
-        await reply_html(message, "Both targets must be set. Run /session first.")
-        return
-
     previous = [s for s in STATE.sources if str(s) in STATE.checkpoints]
     if previous:
         PENDING_CLONE[uid] = True
         await reply_html(
             message,
-            f"<b>{len(previous)}</b> of {len(STATE.sources)} sources already have a checkpoint.\n\n"
-            "/force_continue — resume unfinished sources and catch up finished ones\n"
-            "/force_duplicate — restart every source from the beginning (duplicates allowed)\n"
-            "/skip — only clone sources that were never started",
+            f"<b>{len(previous)}</b> checkpoints exist.\n"
+            "/force_continue — resume\n"
+            "/force_duplicate — restart all\n"
+            "/skip — only untouched",
         )
         return
     await start_manual_clone(message, "auto")
 
 
-async def _clone_choice(message: Message, mode: str) -> None:
-    if not PENDING_CLONE.pop(message.from_user.id, False):
-        await reply_html(message, "Nothing pending. Use /clone first.")
-        return
-    await start_manual_clone(message, mode)
-
-
 @bot.on_message(filters.command("force_continue") & admin_only)
 async def force_continue_handler(client: Client, message: Message) -> None:
-    await _clone_choice(message, "continue")
+    await start_manual_clone(message, "continue")
 
 
 @bot.on_message(filters.command("force_duplicate") & admin_only)
 async def force_duplicate_handler(client: Client, message: Message) -> None:
-    await _clone_choice(message, "duplicate")
+    await start_manual_clone(message, "duplicate")
 
 
 @bot.on_message(filters.command("skip") & admin_only)
 async def skip_handler(client: Client, message: Message) -> None:
-    await _clone_choice(message, "skip")
+    await start_manual_clone(message, "skip")
 
 
-# ---- /status --------------------------------------------------------------- #
 @bot.on_message(filters.command("status") & admin_only)
 async def status_handler(client: Client, message: Message) -> None:
-    if len(message.command) < 2:
-        await reply_html(message, live_status_text())
-        return
-
-    chat = parse_chat_arg(message)
-    if chat is None:
-        await reply_html(message, "I couldn't read that chat. Use an @username, -100… ID or t.me link.")
-        return
-
-    status = await reply_html(message, "⏳ Scanning chat content…")
-    try:
-        await edit_html(status, await chat_report(chat))
-    except Exception as exc:  # noqa: BLE001
-        log.exception("/status failed")
-        await edit_html(status, f"❌ <b>Scan failed</b>\n{friendly_error(exc)}")
+    await reply_html(message, live_status_text())
 
 
-# ---- /stop, /resume, /remove ---------------------------------------------- #
 @bot.on_message(filters.command("stop") & admin_only)
 async def stop_handler(client: Client, message: Message) -> None:
     status = await reply_html(message, "⏳ Stopping…")
@@ -1623,192 +1415,88 @@ async def resume_handler(client: Client, message: Message) -> None:
     RT.stop_event.clear()
     STATE.paused = False
     STATE.save()
-    started = schedule_auto_ingestion()
-    await reply_html(
-        message,
-        "▶️ Live forwarding resumed."
-        + (" Background ingestion continues from the saved checkpoints." if started or RT.ingest_active else ""),
-    )
+    schedule_auto_ingestion()
+    await reply_html(message, "▶️ Resumed.")
 
 
-@bot.on_message(filters.command("remove") & admin_only)
-async def remove_handler(client: Client, message: Message) -> None:
-    status = await reply_html(message, "⏳ Stopping and resetting…")
-    await stop_all()
-    STATE.set_sources([])
-    STATE.checkpoints = {}
-    STATE.save()
-    PENDING_CLONE.clear()
-    PENDING_SESSION.clear()
-    await edit_html(
-        status,
-        "🗑 Saved sources and checkpoints were reset. Targets, thresholds and the media "
-        "de-duplication cache were kept. Forwarding is paused: run /session, then /resume.",
-    )
-
-
-# ---- /cleandup ------------------------------------------------------------- #
-@bot.on_message(filters.command("cleandup") & admin_only)
-async def cleandup_handler(client: Client, message: Message) -> None:
-    if len(message.command) > 1:
-        chat = parse_chat_arg(message)
-        if chat is None:
-            await reply_html(message, "I couldn't read that chat. Use an @username, -100… ID or t.me link.")
-            return
-        chats: List[ChatRef] = [chat]
-    else:
-        chats = [c for c in (STATE.target_links, STATE.target_media) if c]
-        if not chats:
-            await reply_html(message, "No target chats configured. Run /session or pass a chat.")
-            return
-
-    status = await reply_html(message, "⏳ Scanning for duplicates…")
-    lines: List[str] = []
-    for chat in chats:
-        try:
-            scanned, deleted = await dedupe_chat(chat)
-            lines.append(
-                f"<code>{html.escape(str(chat))}</code>: scanned <b>{scanned}</b>, "
-                f"deleted <b>{deleted}</b> duplicates"
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("/cleandup failed for %s", chat)
-            lines.append(f"<code>{html.escape(str(chat))}</code>: ❌ {friendly_error(exc)}")
-        await edit_html(status, "⏳ Cleaning…\n" + "\n".join(lines))
-    await edit_html(status, "🧹 <b>Duplicate cleanup finished</b>\n\n" + "\n".join(lines))
-
-
-# ---- runtime thresholds ---------------------------------------------------- #
 @bot.on_message(filters.command("set_duration") & admin_only)
 async def set_duration_handler(client: Client, message: Message) -> None:
     try:
-        value = int(float(message.command[1]))
-        if value < 0:
-            raise ValueError
+        val = int(float(message.command[1]))
     except (IndexError, ValueError):
-        await reply_html(message, "Usage: <code>/set_duration &lt;seconds&gt;</code> (e.g. 600)")
+        await reply_html(message, "Usage: <code>/set_duration 60</code>")
         return
-    STATE.min_duration = value
+    STATE.min_duration = val
     STATE.save()
-    await reply_html(message, f"✅ Minimum video duration is now <b>{value}s</b>.")
+    await reply_html(message, f"✅ Video duration threshold: <b>{val}s</b>")
 
 
 @bot.on_message(filters.command("set_size") & admin_only)
 async def set_size_handler(client: Client, message: Message) -> None:
     try:
-        value = float(message.command[1])
-        if value < 0:
-            raise ValueError
+        val = float(message.command[1])
     except (IndexError, ValueError):
-        await reply_html(message, "Usage: <code>/set_size &lt;mb&gt;</code> (e.g. 100)")
+        await reply_html(message, "Usage: <code>/set_size 10</code>")
         return
-    STATE.min_size_mb = value
+    STATE.min_size_mb = val
     STATE.save()
-    await reply_html(message, f"✅ Minimum file size is now <b>{value:g} MB</b>.")
-
-
-# --------------------------------------------------------------------------- #
-# Lifecycle
-# --------------------------------------------------------------------------- #
-WEB_RUNNER: Optional["web.AppRunner"] = None
-
-
-async def _web_ok(request: "web.Request") -> "web.Response":
-    return web.Response(text="Bot is running!", status=200)
-
-
-async def dummy_web_server() -> None:
-    """Keep-alive HTTP server so Render's Web Service sees an open PORT."""
-    global WEB_RUNNER
-    app = web.Application()
-    app.router.add_get("/", _web_ok)
-    app.router.add_get("/health", _web_ok)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    WEB_RUNNER = runner
-    log.info("Keep-alive web server listening on 0.0.0.0:%d", port)
+    await reply_html(message, f"✅ File size threshold: <b>{val:g} MB</b>")
 
 
 async def bootstrap() -> None:
-    """Warm peer caches (one get_dialogs pass per userbot) and import env sources."""
     await asyncio.gather(*(refresh_dialogs(c, force=True) for c in USERBOTS))
-
-    # Env sources that were never imported before (new IDs added to SOURCE_CHATS later
-    # are picked up on the next start; sources removed via /session are not re-added).
     new_env = [s for s in config.SOURCE_CHATS if s not in STATE.env_known]
     if new_env:
-        STATE.set_sources(
-            STATE.sources + [s for s in new_env if s not in config.IGNORED_SOURCE_CHATS]
-        )
+        STATE.set_sources(STATE.sources + [s for s in new_env if s not in config.IGNORED_SOURCE_CHATS])
         STATE.env_known = list(dict.fromkeys(STATE.env_known + new_env))
         STATE.save()
-        log.info("Imported %d new source(s) from SOURCE_CHATS", len(new_env))
+        log.info("Imported %d new sources from env", len(new_env))
 
     for target in (STATE.target_links, STATE.target_media):
         if not target:
             continue
         try:
             await bot.get_chat(target)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Bot cannot resolve target %s yet (%s). Make it admin there; it may resolve "
-                "after the first update from that chat.",
-                target,
-                exc,
-            )
+        except Exception as exc:
+            log.warning("Bot cannot resolve %s yet: %s", target, exc)
 
 
 async def graceful_shutdown() -> None:
     log.info("Shutting down gracefully…")
     RT.stop_event.set()
     drain_queue()
-
-    if RT.ingest_task is not None and not RT.ingest_task.done():
-        _, pending = await asyncio.wait({RT.ingest_task}, timeout=30)
-        if pending:
-            RT.ingest_task.cancel()
-            await asyncio.gather(RT.ingest_task, return_exceptions=True)
-
-    if RT.worker_task is not None and not RT.worker_task.done():
+    if RT.ingest_task and not RT.ingest_task.done():
+        RT.ingest_task.cancel()
+    if RT.worker_task and not RT.worker_task.done():
         RT.worker_task.cancel()
-        await asyncio.gather(RT.worker_task, return_exceptions=True)
-
     STATE.save()
     MEDIA_SEEN.save(force=True)
     await asyncio.gather(*(c.stop() for c in USERBOTS), bot.stop(), return_exceptions=True)
-    if WEB_RUNNER is not None:
-        await asyncio.gather(WEB_RUNNER.cleanup(), return_exceptions=True)
     log.info("Stopped.")
 
 
 async def main() -> None:
+    # Render keep-alive server binds first
     await dummy_web_server()
+
     STATE.load()
     MEDIA_SEEN.load()
 
-    # user_1 (+ user_2 when configured) and the bot start concurrently.
     await asyncio.gather(*(c.start() for c in USERBOTS), bot.start())
     RT.worker_task = asyncio.create_task(delivery_worker())
     await bootstrap()
 
     me_bot = await bot.get_me()
     log.info(
-        "Userbots: %d | Bot: @%s | Sources: %d | Ignored channels: %d",
+        "Userbots: %d | Bot: @%s | Sources: %d",
         len(USERBOTS),
         me_bot.username,
         len(STATE.sources),
-        len(config.IGNORED_SOURCE_CHATS),
     )
 
-    # NEW_SOURCE channels (no last_read_id yet) are ingested without any /clone command.
     schedule_auto_ingestion()
 
     try:
-        # idle() installs SIGINT / SIGTERM (and SIGABRT) handlers and returns when one
-        # arrives; the finally block then performs the graceful shutdown.
         await idle()
     finally:
         await graceful_shutdown()
@@ -1819,3 +1507,4 @@ if __name__ == "__main__":
         LOOP.run_until_complete(main())
     except KeyboardInterrupt:
         log.info("Interrupted")
+      
