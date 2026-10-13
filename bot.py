@@ -30,6 +30,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MasterForwarder")
 
+# Safe Admin Filter: Handles int, str, and comma-separated IDs
+def is_admin_filter(_, __, message: Message):
+    if not message.from_user:
+        return False
+    user_id = message.from_user.id
+    admins = config.ADMINS
+    if isinstance(admins, (int, str)):
+        admins = [admins]
+    clean_admins = []
+    for a in admins:
+        if isinstance(a, str):
+            for part in a.split(","):
+                part = part.strip()
+                if part.isdigit() or (part.startswith("-") and part[1:].isdigit()):
+                    clean_admins.append(int(part))
+        elif isinstance(a, int):
+            clean_admins.append(a)
+    return user_id in clean_admins
+
+admin_filter = filters.create(is_admin_filter)
+
 # 1. Main Bot Client (Sends messages, Admin interface, Status)
 bot = Client(
     "master_bot",
@@ -64,7 +85,7 @@ worker_status_ledger = {"Worker-1": "Idle", "Worker-2": "Idle"}
 
 # ----------------- ADMIN COMMANDS ----------------- #
 
-@bot.on_message(filters.command("start") & filters.user(config.ADMINS))
+@bot.on_message(filters.command("start") & admin_filter)
 async def cmd_start(_, message: Message):
     welcome_text = (
         "🤖 **Master Dual-Account Forwarder & Converter Bot**\n\n"
@@ -78,7 +99,13 @@ async def cmd_start(_, message: Message):
     )
     await message.reply(welcome_text)
 
-@bot.on_message(filters.command("addterabox") & filters.user(config.ADMINS))
+# Fallback: Agar non-admin ya ID mismatch ho toh log me user_id dikhe
+@bot.on_message(filters.command("start") & ~admin_filter)
+async def cmd_start_unauthorized(_, message: Message):
+    u_id = message.from_user.id if message.from_user else "Unknown"
+    logger.warning(f"Unauthorized /start attempt from user ID: {u_id}. Add this ID to ADMINS in Render Environment.")
+
+@bot.on_message(filters.command("addterabox") & admin_filter)
 async def cmd_add_terabox(_, message: Message):
     if len(message.command) < 2:
         return await message.reply(
@@ -144,7 +171,7 @@ async def cmd_add_terabox(_, message: Message):
     else:
         return await message.reply("❌ Invalid format! Valid Telegram ID (`-100...`) ya TeraBox / NephoBox Channel Link bhejein.")
 
-@bot.on_message(filters.command("addtelegram") & filters.user(config.ADMINS))
+@bot.on_message(filters.command("addtelegram") & admin_filter)
 async def cmd_add_telegram(_, message: Message):
     if len(message.command) < 2:
         return await message.reply("⚠️ Usage: `/addtelegram <CHANNEL_ID>`")
@@ -154,7 +181,7 @@ async def cmd_add_telegram(_, message: Message):
         return await message.reply(f"⚠️ Source `{src_id}` already exists. Duplicate skipped.")
     await message.reply(f"✅ Registered Telegram Source: `{src_id}`.\nQueued for scanning.")
 
-@bot.on_message(filters.command("removesource") & filters.user(config.ADMINS))
+@bot.on_message(filters.command("removesource") & admin_filter)
 async def cmd_remove_source(_, message: Message):
     if len(message.command) < 2:
         return await message.reply("⚠️ Usage: `/removesource <CHANNEL_ID>`")
@@ -165,7 +192,7 @@ async def cmd_remove_source(_, message: Message):
     else:
         await message.reply(f"❌ Source `{src_id}` database me nahi mila.")
 
-@bot.on_message(filters.command("sources") & filters.user(config.ADMINS))
+@bot.on_message(filters.command("sources") & admin_filter)
 async def cmd_sources(_, message: Message):
     all_src = await SourcesRepo.get_all_sources()
     if not all_src:
@@ -175,19 +202,19 @@ async def cmd_sources(_, message: Message):
         text += f"• `{s['source_id']}` | Type: `{s['source_type']}` | Status: `{s.get('status', 'pending')}` | Last ID: `{s.get('last_processed_id', 0)}`\n"
     await message.reply(text[:4000])
 
-@bot.on_message(filters.command("status") & filters.user(config.ADMINS))
+@bot.on_message(filters.command("status") & admin_filter)
 async def cmd_status(_, message: Message):
     worker_str = f"Worker 1: {worker_status_ledger['Worker-1']} | Worker 2: {worker_status_ledger['Worker-2']}"
     report = await LiveStatus.generate_status_report(worker_str)
     await message.reply(report)
 
-@bot.on_message(filters.command("cleantargets") & filters.user(config.ADMINS))
+@bot.on_message(filters.command("cleantargets") & admin_filter)
 async def cmd_clean_targets(_, message: Message):
     await message.reply("🧹 Starting target duplicate scrubber tasks...")
-    asyncio.create_task(TargetCleaner(bot, config.TERABOX_TARGET).execute_cleanup())
-    asyncio.create_task(TargetCleaner(bot, config.STREAMING_TARGET).execute_cleanup())
+    asyncio.create_task(run_safe_cleanup(bot, config.TERABOX_TARGET))
+    asyncio.create_task(run_safe_cleanup(bot, config.STREAMING_TARGET))
     if config.FINAL_CONVERTED_TARGET:
-        asyncio.create_task(TargetCleaner(bot, config.FINAL_CONVERTED_TARGET).execute_cleanup())
+        asyncio.create_task(run_safe_cleanup(bot, config.FINAL_CONVERTED_TARGET))
     await message.reply("✅ Target duplicate cleaners running in background.")
 
 # ----------------- MESSAGE DISPATCHER ----------------- #
@@ -372,6 +399,19 @@ async def run_history_worker(client: Client, worker_name: str, worker_index: int
 
         await asyncio.sleep(45)
 
+# ----------------- SAFE CLEANUP WRAPPER ----------------- #
+
+async def run_safe_cleanup(client: Client, target_chat_id):
+    if not target_chat_id:
+        return
+    try:
+        cleaner = TargetCleaner(client, target_chat_id)
+        await cleaner.execute_cleanup()
+    except (ValueError, KeyError) as e:
+        logger.warning(f"Target Cleaner skipped for {target_chat_id} (Uncached Peer): {e}")
+    except Exception as e:
+        logger.error(f"Target Cleaner error on {target_chat_id}: {e}")
+
 # ----------------- MAIN INITIALIZER ----------------- #
 
 async def main():
@@ -397,6 +437,15 @@ async def main():
         register_live_listeners(userbot_2, "Userbot-2")
         active_userbots.append(("Worker-2", userbot_2))
 
+    # WARM UP PEER CACHES (Resolves access_hash for all joined channels)
+    all_clients = [bot] + [c for _, c in active_userbots]
+    for cl in all_clients:
+        try:
+            async for _ in cl.get_dialogs(limit=50):
+                pass
+        except Exception as e:
+            logger.warning(f"Cache warmup warning: {e}")
+
     if not active_userbots:
         register_live_listeners(bot, "Main-Bot")
         asyncio.create_task(run_history_worker(bot, "Worker-1", 0, 1))
@@ -405,15 +454,7 @@ async def main():
         for idx, (w_name, ub_client) in enumerate(active_userbots):
             asyncio.create_task(run_history_worker(ub_client, w_name, idx, num_workers))
 
-    # Run Startup Target channel Scrubbers
-    asyncio.create_task(TargetCleaner(bot, config.TERABOX_TARGET).execute_cleanup())
-    asyncio.create_task(TargetCleaner(bot, config.STREAMING_TARGET).execute_cleanup())
-    if config.FINAL_CONVERTED_TARGET:
-        asyncio.create_task(TargetCleaner(bot, config.FINAL_CONVERTED_TARGET).execute_cleanup())
-
-    logger.info("Master Dual-Userbot Forwarder Engine is active and operational.")
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
+    # Safe Startup Target channel Scrubbers (Won't crash the bot if peer invalid)
+    asyncio.create_task(run_safe_cleanup(bot, config.TERABOX_TARGET))
+    asyncio.create_task
+        
