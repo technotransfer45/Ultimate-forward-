@@ -456,5 +456,13 @@ async def main():
 
     # Safe Startup Target channel Scrubbers (Won't crash the bot if peer invalid)
     asyncio.create_task(run_safe_cleanup(bot, config.TERABOX_TARGET))
-    asyncio.create_task
+    asyncio.create_task(run_safe_cleanup(bot, config.STREAMING_TARGET))
+    if config.FINAL_CONVERTED_TARGET:
+        asyncio.create_task(run_safe_cleanup(bot, config.FINAL_CONVERTED_TARGET))
+
+    logger.info("Master Dual-Userbot Forwarder Engine is active and operational.")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
         
