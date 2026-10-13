@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 from pyrogram import Client
+from pyrogram.errors import FloodWait, RPCError, ChannelPrivate, ChatAdminRequired
 from database.mongo import duplicates_col, checkpoints_col
 from modules.link_extractor import LinkExtractor
 from utils.retry import handle_floodwait
@@ -9,9 +10,17 @@ from utils.retry import handle_floodwait
 logger = logging.getLogger(__name__)
 
 class TargetCleaner:
-    def __init__(self, client: Client, channel_id: int):
+    def __init__(self, client: Client, channel_id):
         self.client = client
-        self.channel_id = channel_id
+        # String numeric ID ko proper integer me cast karna zaroori hai
+        if isinstance(channel_id, str):
+            clean_str = channel_id.strip()
+            if clean_str.startswith("-100") or clean_str.isdigit() or (clean_str.startswith("-") and clean_str[1:].isdigit()):
+                self.channel_id = int(clean_str)
+            else:
+                self.channel_id = clean_str
+        else:
+            self.channel_id = channel_id
 
     async def execute_cleanup(self):
         if not self.channel_id:
@@ -23,6 +32,22 @@ class TargetCleaner:
 
         logger.info(f"Target Cleaner starting for {self.channel_id} at message ID {last_scanned_id}")
         current_max_id = last_scanned_id
+
+        # Peer Validation Check (Prevents Peer id invalid crash)
+        try:
+            await self.client.get_chat(self.channel_id)
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Target Cleaner skipped for {self.channel_id} (Uncached Peer / Missing Access Hash): {e}")
+            return
+        except (ChannelPrivate, ChatAdminRequired):
+            logger.warning(f"Target Cleaner skipped for {self.channel_id}: Bot lacks admin permissions or access.")
+            return
+        except RPCError as e:
+            logger.warning(f"Target Cleaner RPC error on {self.channel_id}: {e}")
+            return
+        except Exception as e:
+            logger.error(f"Target Cleaner pre-check failed for {self.channel_id}: {e}")
+            return
 
         try:
             async for message in self.client.get_chat_history(self.channel_id):
@@ -65,5 +90,11 @@ class TargetCleaner:
                 {"$set": {"last_processed_id": current_max_id}},
                 upsert=True
             )
+        except FloodWait as fw:
+            logger.warning(f"FloodWait during cleanup on {self.channel_id}. Sleeping {fw.value}s.")
+            await asyncio.sleep(fw.value + 2)
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Cleanup peer resolution lost for {self.channel_id}: {e}")
         except Exception as e:
             logger.error(f"Cleanup failure for {self.channel_id}: {str(e)}")
+        
